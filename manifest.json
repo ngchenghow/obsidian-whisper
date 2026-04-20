@@ -1,0 +1,10 @@
+{
+	"id": "obsidian-whisper",
+	"name": "Whisper Transcription",
+	"version": "0.1.0",
+	"minAppVersion": "1.4.0",
+	"description": "Transcribe local mp3/mp4 files into notes using the Whisper CLI.",
+	"author": "ngchenghow",
+	"authorUrl": "https://github.com/ngchenghow",
+	"isDesktopOnly": true
+}
