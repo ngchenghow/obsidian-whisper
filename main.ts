@@ -22,7 +22,7 @@ interface WhisperSettings {
 
 const DEFAULT_CAPTURE_ARGS =
 	process.platform === "win32"
-		? "-f dshow -i audio=Stereo Mix"
+		? `-f dshow -i "audio=Stereo Mix"`
 		: process.platform === "darwin"
 		? "-f avfoundation -i :0"
 		: "-f pulse -i default.monitor";
@@ -322,9 +322,7 @@ export default class WhisperPlugin extends Plugin {
 			if (this.recording === handle) {
 				// Unexpected exit (not via stop command).
 				this.recording = null;
-				loader.fail(
-					`ffmpeg exited with code ${code}. ${stderr.slice(-300) || ""}`,
-				);
+				loader.fail(diagnoseFfmpegError(code, stderr, captureArgs));
 			}
 		});
 	}
@@ -692,6 +690,29 @@ function cleanStdout(s: string): string {
 		.join("\n");
 }
 
+function diagnoseFfmpegError(
+	code: number | null,
+	stderr: string,
+	captureArgs: string,
+): string {
+	const tail = stderr.slice(-500).trim();
+	const missingDevice =
+		/Could not find (audio|video).*device with name/i.test(stderr) ||
+		/Error opening input/i.test(stderr);
+	const hasUnquotedSpaceInInput = /-i\s+[^"']*\S\s\S/.test(captureArgs);
+
+	let hint = "";
+	if (missingDevice && hasUnquotedSpaceInInput) {
+		hint =
+			`\n\nHint: your capture input looks unquoted. Values containing spaces must be quoted, e.g. -i "audio=Stereo Mix". Update the setting.`;
+	} else if (missingDevice) {
+		hint =
+			`\n\nHint: the device name wasn't found. List DirectShow devices with:  ffmpeg -list_devices true -f dshow -i dummy  and copy the exact name into the capture args setting (wrap it in quotes).`;
+	}
+
+	return `ffmpeg exited with code ${code}. ${tail || "(no stderr)"}${hint}`;
+}
+
 function waitForClose(
 	child: ChildProcess,
 	timeoutMs: number,
@@ -933,7 +954,7 @@ class WhisperSettingTab extends PluginSettingTab {
 		new Setting(containerEl)
 			.setName("Capture input arguments")
 			.setDesc(
-				"FFmpeg input args for system audio loopback. Windows: '-f dshow -i audio=Stereo Mix' (enable Stereo Mix in Sound control panel). macOS: '-f avfoundation -i :N' (requires BlackHole / Loopback as device N). Linux: '-f pulse -i default.monitor'. List Windows devices with: ffmpeg -list_devices true -f dshow -i dummy",
+				`FFmpeg input args for system audio loopback. IMPORTANT: quote any value that contains spaces. Windows: -f dshow -i "audio=Stereo Mix" (enable Stereo Mix in Sound control panel). macOS: -f avfoundation -i :N (requires BlackHole / Loopback as device N). Linux: -f pulse -i default.monitor. List Windows devices with: ffmpeg -list_devices true -f dshow -i dummy`,
 			)
 			.addText((text) =>
 				text
