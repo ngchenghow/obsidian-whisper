@@ -363,7 +363,56 @@ function splitArgs(s: string): string[] {
 	return out;
 }
 
-function pickMediaFile(): Promise<string | null> {
+async function pickMediaFile(): Promise<string | null> {
+	// Preferred path: Electron's native Open dialog.
+	const viaDialog = await pickViaElectronDialog();
+	if (viaDialog !== undefined) return viaDialog;
+
+	// Fallback: hidden <input type="file"> + webUtils.getPathForFile.
+	return pickViaHtmlInput();
+}
+
+/**
+ * Returns `string | null` on success (null == user cancelled),
+ * or `undefined` when the Electron dialog API isn't reachable — in which
+ * case the caller should try the HTML input fallback.
+ */
+async function pickViaElectronDialog(): Promise<string | null | undefined> {
+	try {
+		// @ts-ignore — window.require exists only inside Electron.
+		const req: NodeRequire | undefined = (window as any).require;
+		if (!req) return undefined;
+
+		let dialog: any;
+		try {
+			dialog = req("@electron/remote").dialog;
+		} catch {
+			try {
+				dialog = req("electron").remote?.dialog;
+			} catch {
+				/* ignore */
+			}
+		}
+		if (!dialog?.showOpenDialog) return undefined;
+
+		const extensions = MEDIA_EXTS.map((e) => e.replace(/^\./, ""));
+		const result = await dialog.showOpenDialog({
+			title: "Select media file to transcribe",
+			properties: ["openFile"],
+			filters: [
+				{ name: "Audio / video", extensions },
+				{ name: "All files", extensions: ["*"] },
+			],
+		});
+		if (result.canceled || !result.filePaths?.[0]) return null;
+		return result.filePaths[0] as string;
+	} catch (err) {
+		console.warn("whisper: electron dialog failed, falling back", err);
+		return undefined;
+	}
+}
+
+function pickViaHtmlInput(): Promise<string | null> {
 	return new Promise((resolve) => {
 		const input = document.createElement("input");
 		input.type = "file";
@@ -380,26 +429,42 @@ function pickMediaFile(): Promise<string | null> {
 		};
 
 		input.addEventListener("change", () => {
-			const file = input.files?.[0] as
-				| (File & { path?: string })
-				| undefined;
+			const file = input.files?.[0];
 			if (!file) {
 				finish(null);
 				return;
 			}
-			if (!file.path) {
+			const resolved = resolveFilePath(file);
+			if (!resolved) {
 				new Notice(
-					"Could not resolve the file's absolute path. Your Obsidian/Electron version may not expose it.",
+					"Could not resolve the file's absolute path. Try the 'Transcribe media from current line' command with a pasted path instead.",
 				);
 				finish(null);
 				return;
 			}
-			finish(file.path);
+			finish(resolved);
 		});
 		input.addEventListener("cancel", () => finish(null));
 
 		input.click();
 	});
+}
+
+function resolveFilePath(file: File): string | null {
+	// Older Electron exposed `.path` directly.
+	const legacy = (file as unknown as { path?: string }).path;
+	if (legacy) return legacy;
+
+	// Electron 32+ requires webUtils.getPathForFile().
+	try {
+		// @ts-ignore — window.require exists only inside Electron.
+		const electron = (window as any).require?.("electron");
+		const p = electron?.webUtils?.getPathForFile?.(file);
+		if (typeof p === "string" && p) return p;
+	} catch {
+		/* ignore */
+	}
+	return null;
 }
 
 class WhisperSettingTab extends PluginSettingTab {
