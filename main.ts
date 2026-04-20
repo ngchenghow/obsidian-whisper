@@ -1,7 +1,6 @@
 import {
 	App,
 	Editor,
-	MarkdownView,
 	Modal,
 	Notice,
 	Plugin,
@@ -38,16 +37,16 @@ export default class WhisperPlugin extends Plugin {
 		this.addCommand({
 			id: "transcribe-from-current-line",
 			name: "Transcribe media from current line",
-			editorCallback: (editor, view) =>
-				this.transcribeFromCurrentLine(editor, view),
+			editorCallback: (editor) =>
+				this.transcribeFromCurrentLine(editor),
 		});
 
 		this.addCommand({
 			id: "transcribe-from-prompt",
 			name: "Transcribe media (prompt for path)",
-			editorCallback: (editor, view) =>
+			editorCallback: (editor) =>
 				new PathPromptModal(this.app, async (filePath) => {
-					await this.transcribeAndInsert(filePath, editor, view);
+					await this.transcribeAndInsert(filePath, editor);
 				}).open(),
 		});
 
@@ -68,10 +67,7 @@ export default class WhisperPlugin extends Plugin {
 		await this.saveData(this.settings);
 	}
 
-	private async transcribeFromCurrentLine(
-		editor: Editor,
-		view: MarkdownView,
-	) {
+	private async transcribeFromCurrentLine(editor: Editor) {
 		const cursor = editor.getCursor();
 		const line = editor.getLine(cursor.line);
 		const filePath = extractPath(line);
@@ -81,14 +77,10 @@ export default class WhisperPlugin extends Plugin {
 			);
 			return;
 		}
-		await this.transcribeAndInsert(filePath, editor, view);
+		await this.transcribeAndInsert(filePath, editor);
 	}
 
-	private async transcribeAndInsert(
-		filePath: string,
-		editor: Editor,
-		_view: MarkdownView,
-	) {
+	private async transcribeAndInsert(filePath: string, editor: Editor) {
 		const resolved = path.resolve(filePath.trim());
 		try {
 			await fs.access(resolved);
