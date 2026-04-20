@@ -1,7 +1,6 @@
 import {
 	App,
 	Editor,
-	Modal,
 	Notice,
 	Plugin,
 	PluginSettingTab,
@@ -42,12 +41,13 @@ export default class WhisperPlugin extends Plugin {
 		});
 
 		this.addCommand({
-			id: "transcribe-from-prompt",
-			name: "Transcribe media (prompt for path)",
-			editorCallback: (editor) =>
-				new PathPromptModal(this.app, async (filePath) => {
-					await this.transcribeAndInsert(filePath, editor);
-				}).open(),
+			id: "transcribe-choose-file",
+			name: "Transcribe media (choose file…)",
+			editorCallback: async (editor) => {
+				const picked = await pickMediaFile();
+				if (!picked) return;
+				await this.transcribeAndInsert(picked, editor);
+			},
 		});
 
 		this.addSettingTab(new WhisperSettingTab(this.app, this));
@@ -70,12 +70,10 @@ export default class WhisperPlugin extends Plugin {
 	private async transcribeFromCurrentLine(editor: Editor) {
 		const cursor = editor.getCursor();
 		const line = editor.getLine(cursor.line);
-		const filePath = extractPath(line);
+		let filePath = extractPath(line);
 		if (!filePath) {
-			new Notice(
-				"No media file path found on this line. Paste a path to an mp3/mp4 file and try again.",
-			);
-			return;
+			filePath = await pickMediaFile();
+			if (!filePath) return;
 		}
 		await this.transcribeAndInsert(filePath, editor);
 	}
@@ -293,60 +291,43 @@ function splitArgs(s: string): string[] {
 	return out;
 }
 
-class PathPromptModal extends Modal {
-	private onSubmit: (filePath: string) => void | Promise<void>;
-	private value = "";
+function pickMediaFile(): Promise<string | null> {
+	return new Promise((resolve) => {
+		const input = document.createElement("input");
+		input.type = "file";
+		input.accept = MEDIA_EXTS.join(",");
+		input.style.display = "none";
+		document.body.appendChild(input);
 
-	constructor(
-		app: App,
-		onSubmit: (filePath: string) => void | Promise<void>,
-	) {
-		super(app);
-		this.onSubmit = onSubmit;
-	}
+		let settled = false;
+		const finish = (value: string | null) => {
+			if (settled) return;
+			settled = true;
+			input.remove();
+			resolve(value);
+		};
 
-	onOpen() {
-		this.titleEl.setText("Transcribe media file");
-		const input = this.contentEl.createEl("input", {
-			type: "text",
-			placeholder: "Absolute path to mp3/mp4 file…",
-		});
-		input.style.width = "100%";
-		input.addEventListener("input", (e) => {
-			this.value = (e.target as HTMLInputElement).value;
-		});
-		input.addEventListener("keydown", (e) => {
-			if (e.key === "Enter") {
-				e.preventDefault();
-				this.submit();
+		input.addEventListener("change", () => {
+			const file = input.files?.[0] as
+				| (File & { path?: string })
+				| undefined;
+			if (!file) {
+				finish(null);
+				return;
 			}
+			if (!file.path) {
+				new Notice(
+					"Could not resolve the file's absolute path. Your Obsidian/Electron version may not expose it.",
+				);
+				finish(null);
+				return;
+			}
+			finish(file.path);
 		});
-		setTimeout(() => input.focus(), 10);
+		input.addEventListener("cancel", () => finish(null));
 
-		const buttonRow = this.contentEl.createDiv();
-		buttonRow.style.marginTop = "0.75em";
-		buttonRow.style.display = "flex";
-		buttonRow.style.justifyContent = "flex-end";
-		buttonRow.style.gap = "0.5em";
-
-		const cancel = buttonRow.createEl("button", { text: "Cancel" });
-		cancel.addEventListener("click", () => this.close());
-
-		const submit = buttonRow.createEl("button", { text: "Transcribe" });
-		submit.addClass("mod-cta");
-		submit.addEventListener("click", () => this.submit());
-	}
-
-	private submit() {
-		const v = this.value.trim();
-		if (!v) return;
-		this.close();
-		void this.onSubmit(v);
-	}
-
-	onClose() {
-		this.contentEl.empty();
-	}
+		input.click();
+	});
 }
 
 class WhisperSettingTab extends PluginSettingTab {

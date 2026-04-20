@@ -4,14 +4,12 @@ Transcribe local `mp3` / `mp4` (and other common audio/video) files into your no
 
 ## How it works
 
-1. In a note, paste the absolute path to an audio/video file on its own line — e.g.
-   ```
-   C:\Users\me\Recordings\meeting.mp4
-   ```
-2. Place the cursor on that line and run the command **"Transcribe media from current line"**.
-3. The plugin invokes `whisper` on the file and inserts the transcript directly below the path.
+Two commands:
 
-Alternatively, run **"Transcribe media (prompt for path)"** to paste a path into a modal — the transcript is inserted at the cursor.
+- **Transcribe media (choose file…)** — opens your OS file browser. Pick an mp3/mp4 file and the transcript is inserted at the cursor.
+- **Transcribe media from current line** — reads the absolute path from the line under the cursor. If the line is empty, falls back to the file browser.
+
+While `whisper` runs, an animated callout is rendered directly below the path showing the current model and a spinner. It is replaced by the transcript when the process completes (or an error line if it fails).
 
 Supported extensions: `.mp3`, `.mp4`, `.m4a`, `.wav`, `.webm`, `.ogg`, `.flac`.
 
