@@ -180,9 +180,9 @@ export default class WhisperPlugin extends Plugin {
 			fs.rm(outDir, { recursive: true, force: true }).catch(() => {});
 
 		const result = done.then(
-			async () => {
+			async (stdout) => {
 				try {
-					return await readTranscript(outDir, mediaPath);
+					return await readTranscript(outDir, mediaPath, stdout);
 				} finally {
 					cleanup();
 				}
@@ -318,14 +318,16 @@ class InlineLoader {
 function runProcess(
 	cmd: string,
 	args: string[],
-): { child: ChildProcess; done: Promise<void> } {
+): { child: ChildProcess; done: Promise<string> } {
 	const child = spawn(cmd, args, { shell: false });
+	let stdout = "";
 	let stderr = "";
+	child.stdout?.on("data", (chunk) => (stdout += chunk.toString()));
 	child.stderr?.on("data", (chunk) => (stderr += chunk.toString()));
-	const done = new Promise<void>((resolve, reject) => {
+	const done = new Promise<string>((resolve, reject) => {
 		child.on("error", reject);
 		child.on("close", (code, signal) => {
-			if (code === 0) resolve();
+			if (code === 0) resolve(stdout);
 			else
 				reject(
 					new Error(
@@ -340,28 +342,58 @@ function runProcess(
 async function readTranscript(
 	outDir: string,
 	mediaPath: string,
+	stdout: string,
 ): Promise<string> {
 	const files = await fs.readdir(outDir);
 	const txts = files.filter((f) => f.toLowerCase().endsWith(".txt"));
-	if (txts.length === 0) {
-		throw new Error(
-			`Whisper produced no .txt file. Output dir contents: ${files.join(", ") || "(empty)"}. If your whisper fork doesn't support --output_format, add the right flag via "Extra CLI arguments" in settings.`,
+
+	if (txts.length > 0) {
+		const mediaBase = path
+			.basename(mediaPath, path.extname(mediaPath))
+			.toLowerCase();
+		const exact = txts.find(
+			(f) => path.basename(f, ".txt").toLowerCase() === mediaBase,
 		);
+		const chosen = exact ? [exact] : txts;
+
+		const parts = await Promise.all(
+			chosen.map((f) => fs.readFile(path.join(outDir, f), "utf8")),
+		);
+		const text = parts.map((p) => p.trim()).filter(Boolean).join("\n\n");
+		if (text) return text;
 	}
 
-	// Prefer a file whose basename matches the media file (any extension stripped).
-	const mediaBase = path
-		.basename(mediaPath, path.extname(mediaPath))
-		.toLowerCase();
-	const exact = txts.find(
-		(f) => path.basename(f, ".txt").toLowerCase() === mediaBase,
-	);
-	const chosen = exact ? [exact] : txts;
+	// No file written — fall back to the process's stdout.
+	const fromStdout = cleanStdout(stdout);
+	if (fromStdout) return fromStdout;
 
-	const parts = await Promise.all(
-		chosen.map((f) => fs.readFile(path.join(outDir, f), "utf8")),
+	throw new Error(
+		`Whisper produced no transcript (no .txt file and stdout was empty). Output dir: ${files.join(", ") || "(empty)"}.`,
 	);
-	return parts.map((p) => p.trim()).filter(Boolean).join("\n\n");
+}
+
+function cleanStdout(s: string): string {
+	if (!s) return "";
+	// Strip ANSI escape sequences (colours, cursor moves, etc.).
+	let out = s.replace(/\x1B\[[0-9;?]*[A-Za-z]/g, "");
+	// Drop carriage-return overwrites used by progress bars — keep only the last segment on each line.
+	out = out
+		.split(/\r?\n/)
+		.map((line) => {
+			const parts = line.split("\r");
+			return parts[parts.length - 1];
+		})
+		.join("\n");
+	// Strip leading "[hh:mm:ss.sss --> hh:mm:ss.sss]" timestamp prefixes.
+	out = out.replace(/^\s*\[[^\]]*-->[^\]]*\]\s*/gm, "");
+	// Drop tqdm-style progress bar lines.
+	out = out
+		.split("\n")
+		.filter((l) => !/^\s*\d+%\|/.test(l))
+		.join("\n");
+	// Collapse runs of blank lines.
+	out = out.replace(/\n{3,}/g, "\n\n");
+	return out.trim();
 }
 
 function killChild(child: ChildProcess) {
