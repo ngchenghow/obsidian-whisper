@@ -1,6 +1,7 @@
 import {
 	App,
 	Editor,
+	Modal,
 	Notice,
 	Plugin,
 	PluginSettingTab,
@@ -93,6 +94,12 @@ export default class WhisperPlugin extends Plugin {
 			id: "stop-recording-and-transcribe",
 			name: "Stop recording and transcribe",
 			callback: () => this.stopRecordingAndTranscribe(),
+		});
+
+		this.addCommand({
+			id: "list-audio-devices",
+			name: "List system audio devices (for capture args)",
+			callback: () => this.listAudioDevices(),
 		});
 
 		this.addSettingTab(new WhisperSettingTab(this.app, this));
@@ -325,6 +332,46 @@ export default class WhisperPlugin extends Plugin {
 				loader.fail(diagnoseFfmpegError(code, stderr, captureArgs));
 			}
 		});
+	}
+
+	private async listAudioDevices() {
+		const spec = listDevicesCommand(this.settings.ffmpegPath);
+		if (!spec) {
+			new Notice(
+				"Device listing isn't supported on this platform. Consult your OS's audio tooling.",
+			);
+			return;
+		}
+		const notice = new Notice("Querying audio devices…", 0);
+		let raw = "";
+		try {
+			raw = await captureCommand(spec.cmd, spec.args);
+		} catch (err) {
+			notice.hide();
+			new Notice(
+				`Failed to query devices (${spec.cmd}): ${err instanceof Error ? err.message : String(err)}`,
+			);
+			return;
+		}
+		notice.hide();
+
+		const devices = parseAudioDevices(spec.format, raw);
+		new DeviceListModal(
+			this.app,
+			raw,
+			devices,
+			spec.format,
+			async (device) => {
+				this.settings.captureArgs = buildCaptureArgs(
+					spec.format,
+					device,
+				);
+				await this.saveSettings();
+				new Notice(
+					`Capture args set: ${this.settings.captureArgs}`,
+				);
+			},
+		).open();
 	}
 
 	private async stopRecordingAndTranscribe() {
@@ -745,6 +792,177 @@ function killChild(child: ChildProcess) {
 		});
 	} else {
 		child.kill();
+	}
+}
+
+type CaptureFormat = "dshow" | "avfoundation" | "pulse";
+
+interface ListDevicesSpec {
+	cmd: string;
+	args: string[];
+	format: CaptureFormat;
+}
+
+interface AudioDevice {
+	label: string;
+	value: string;
+}
+
+function listDevicesCommand(ffmpegPath: string): ListDevicesSpec | null {
+	if (process.platform === "win32") {
+		return {
+			cmd: ffmpegPath,
+			args: [
+				"-hide_banner",
+				"-list_devices",
+				"true",
+				"-f",
+				"dshow",
+				"-i",
+				"dummy",
+			],
+			format: "dshow",
+		};
+	}
+	if (process.platform === "darwin") {
+		return {
+			cmd: ffmpegPath,
+			args: [
+				"-hide_banner",
+				"-f",
+				"avfoundation",
+				"-list_devices",
+				"true",
+				"-i",
+				"",
+			],
+			format: "avfoundation",
+		};
+	}
+	// Assume PulseAudio/PipeWire on Linux.
+	return { cmd: "pactl", args: ["list", "sources", "short"], format: "pulse" };
+}
+
+function captureCommand(cmd: string, args: string[]): Promise<string> {
+	return new Promise((resolve, reject) => {
+		let child: ChildProcess;
+		try {
+			child = spawn(cmd, args, { shell: false });
+		} catch (err) {
+			reject(err);
+			return;
+		}
+		let buf = "";
+		child.stdout?.on("data", (c) => (buf += c.toString()));
+		child.stderr?.on("data", (c) => (buf += c.toString()));
+		child.on("error", reject);
+		child.on("close", () => resolve(buf));
+	});
+}
+
+function parseAudioDevices(
+	format: CaptureFormat,
+	output: string,
+): AudioDevice[] {
+	const lines = output.split(/\r?\n/);
+	if (format === "dshow") {
+		const start = lines.findIndex((l) =>
+			/DirectShow audio devices/i.test(l),
+		);
+		if (start < 0) return [];
+		const devices: AudioDevice[] = [];
+		for (let i = start + 1; i < lines.length; i++) {
+			const l = lines[i];
+			if (/DirectShow .*devices/i.test(l)) break;
+			if (/Alternative name/i.test(l)) continue;
+			const m = l.match(/"([^"]+)"/);
+			if (m) devices.push({ label: m[1], value: m[1] });
+		}
+		return devices;
+	}
+	if (format === "avfoundation") {
+		const start = lines.findIndex((l) =>
+			/AVFoundation audio devices/i.test(l),
+		);
+		if (start < 0) return [];
+		const devices: AudioDevice[] = [];
+		for (let i = start + 1; i < lines.length; i++) {
+			const m = lines[i].match(/\[(\d+)\]\s+(.+)$/);
+			if (m) devices.push({ label: `[${m[1]}] ${m[2].trim()}`, value: m[1] });
+		}
+		return devices;
+	}
+	if (format === "pulse") {
+		const devices: AudioDevice[] = [];
+		for (const l of lines) {
+			const cols = l.split("\t");
+			const name = cols[1]?.trim();
+			if (name) devices.push({ label: name, value: name });
+		}
+		return devices;
+	}
+	return [];
+}
+
+function buildCaptureArgs(
+	format: CaptureFormat,
+	device: AudioDevice,
+): string {
+	if (format === "dshow") return `-f dshow -i "audio=${device.value}"`;
+	if (format === "avfoundation") return `-f avfoundation -i :${device.value}`;
+	return `-f pulse -i ${device.value}`;
+}
+
+class DeviceListModal extends Modal {
+	constructor(
+		app: App,
+		private raw: string,
+		private devices: AudioDevice[],
+		private format: CaptureFormat,
+		private onPick: (d: AudioDevice) => void | Promise<void>,
+	) {
+		super(app);
+	}
+
+	onOpen() {
+		this.titleEl.setText("System audio devices");
+		const { contentEl } = this;
+
+		if (this.devices.length === 0) {
+			contentEl.createEl("p", {
+				text: "No audio devices detected. See the raw output below. On Windows you may need to enable 'Stereo Mix' in Sound settings, or install a virtual loopback driver such as VB-CABLE.",
+			});
+		} else {
+			contentEl.createEl("p", {
+				text: `Click a device to set it as your capture input (${this.format}):`,
+			});
+			const list = contentEl.createEl("div");
+			list.style.display = "flex";
+			list.style.flexDirection = "column";
+			list.style.gap = "0.25em";
+			list.style.marginBottom = "0.75em";
+			for (const d of this.devices) {
+				const btn = list.createEl("button", { text: d.label });
+				btn.style.textAlign = "left";
+				btn.addEventListener("click", async () => {
+					await this.onPick(d);
+					this.close();
+				});
+			}
+		}
+
+		const details = contentEl.createEl("details");
+		details.createEl("summary", { text: "Raw output" });
+		const pre = details.createEl("pre");
+		pre.style.maxHeight = "20em";
+		pre.style.overflow = "auto";
+		pre.style.fontSize = "0.8em";
+		pre.style.whiteSpace = "pre-wrap";
+		pre.setText(this.raw || "(no output)");
+	}
+
+	onClose() {
+		this.contentEl.empty();
 	}
 }
 
