@@ -130,8 +130,12 @@ export default class WhisperPlugin extends Plugin {
 		loader.start();
 
 		let handle: Transcription | null = null;
+		const onLine = (line: string) => {
+			if (handle?.cancelled) return;
+			loader.appendTranscriptLine(line);
+		};
 		try {
-			const { child, result } = await this.startWhisper(resolved);
+			const { child, result } = await this.startWhisper(resolved, onLine);
 			handle = { child, loader, cancelled: false };
 			this.active.add(handle);
 			const transcript = await result;
@@ -155,6 +159,7 @@ export default class WhisperPlugin extends Plugin {
 
 	private async startWhisper(
 		mediaPath: string,
+		onStdoutLine?: (line: string) => void,
 	): Promise<{ child: ChildProcess; result: Promise<string> }> {
 		const outDir = await fs.mkdtemp(
 			path.join(os.tmpdir(), "obsidian-whisper-"),
@@ -175,7 +180,11 @@ export default class WhisperPlugin extends Plugin {
 			args.push(...splitArgs(this.settings.extraArgs.trim()));
 		}
 
-		const { child, done } = runProcess(this.settings.whisperPath, args);
+		const { child, done } = runProcess(
+			this.settings.whisperPath,
+			args,
+			onStdoutLine,
+		);
 		const cleanup = () =>
 			fs.rm(outDir, { recursive: true, force: true }).catch(() => {});
 
@@ -232,6 +241,7 @@ class InlineLoader {
 	private suffix: string;
 	private frame = 0;
 	private interval: ReturnType<typeof setInterval> | null = null;
+	private streamedAny = false;
 
 	constructor(editor: Editor, filename: string, model: string) {
 		this.editor = editor;
@@ -253,8 +263,20 @@ class InlineLoader {
 		this.interval = setInterval(() => this.tick(), 120);
 	}
 
+	appendTranscriptLine(line: string) {
+		const loaderLine = this.findLoaderLine();
+		if (loaderLine < 0) return;
+		// Insert "<line>\n" at the start of the loader line — the loader slides down.
+		this.editor.replaceRange(`${line}\n`, { line: loaderLine, ch: 0 });
+		this.streamedAny = true;
+	}
+
 	finish(transcript: string) {
-		this.replaceLoaderWith(transcript);
+		if (this.streamedAny) {
+			this.removeLoader();
+		} else {
+			this.replaceLoaderWith(transcript);
+		}
 	}
 
 	fail(message: string) {
@@ -262,7 +284,40 @@ class InlineLoader {
 	}
 
 	cancel() {
-		this.replaceLoaderWith(`> ⚠️ Transcription cancelled.`);
+		if (this.streamedAny) {
+			this.stop();
+			const loaderLine = this.findLoaderLine();
+			if (loaderLine < 0) return;
+			this.rewriteLine(loaderLine, `> ⚠️ Transcription cancelled.`);
+		} else {
+			this.replaceLoaderWith(`> ⚠️ Transcription cancelled.`);
+		}
+	}
+
+	private removeLoader() {
+		this.stop();
+		const loaderLine = this.findLoaderLine();
+		if (loaderLine < 0) return;
+		const lastLine = this.editor.lineCount() - 1;
+		if (loaderLine < lastLine) {
+			// Remove this line and its trailing newline.
+			this.editor.replaceRange(
+				"",
+				{ line: loaderLine, ch: 0 },
+				{ line: loaderLine + 1, ch: 0 },
+			);
+		} else {
+			// Last line of the doc — remove the preceding newline too.
+			const prevEnd =
+				loaderLine > 0
+					? this.editor.getLine(loaderLine - 1).length
+					: 0;
+			this.editor.replaceRange(
+				"",
+				{ line: Math.max(0, loaderLine - 1), ch: prevEnd },
+				{ line: loaderLine, ch: this.editor.getLine(loaderLine).length },
+			);
+		}
 	}
 
 	private tick() {
@@ -318,15 +373,34 @@ class InlineLoader {
 function runProcess(
 	cmd: string,
 	args: string[],
+	onStdoutLine?: (line: string) => void,
 ): { child: ChildProcess; done: Promise<string> } {
 	const child = spawn(cmd, args, { shell: false });
 	let stdout = "";
 	let stderr = "";
-	child.stdout?.on("data", (chunk) => (stdout += chunk.toString()));
+	let pending = "";
+
+	const emitLines = (flush: boolean) => {
+		if (!onStdoutLine) return;
+		const parts = pending.split(/\r?\n/);
+		pending = flush ? "" : (parts.pop() ?? "");
+		for (const raw of parts) {
+			const cleaned = cleanLine(raw);
+			if (cleaned) onStdoutLine(cleaned);
+		}
+	};
+
+	child.stdout?.on("data", (chunk) => {
+		const s = chunk.toString();
+		stdout += s;
+		pending += s;
+		emitLines(false);
+	});
 	child.stderr?.on("data", (chunk) => (stderr += chunk.toString()));
 	const done = new Promise<string>((resolve, reject) => {
 		child.on("error", reject);
 		child.on("close", (code, signal) => {
+			emitLines(true);
 			if (code === 0) resolve(stdout);
 			else
 				reject(
@@ -337,6 +411,20 @@ function runProcess(
 		});
 	});
 	return { child, done };
+}
+
+function cleanLine(raw: string): string | null {
+	// Strip ANSI escape sequences.
+	let s = raw.replace(/\x1B\[[0-9;?]*[A-Za-z]/g, "");
+	// Keep only the content after the last \r (tqdm overwrites).
+	const parts = s.split("\r");
+	s = parts[parts.length - 1];
+	// Drop tqdm progress bar lines.
+	if (/^\s*\d+%\|/.test(s)) return null;
+	// Strip "[hh:mm:ss --> hh:mm:ss]" timestamp prefix.
+	s = s.replace(/^\s*\[[^\]]*-->[^\]]*\]\s*/, "");
+	s = s.trim();
+	return s || null;
 }
 
 async function readTranscript(
@@ -374,26 +462,11 @@ async function readTranscript(
 
 function cleanStdout(s: string): string {
 	if (!s) return "";
-	// Strip ANSI escape sequences (colours, cursor moves, etc.).
-	let out = s.replace(/\x1B\[[0-9;?]*[A-Za-z]/g, "");
-	// Drop carriage-return overwrites used by progress bars — keep only the last segment on each line.
-	out = out
+	return s
 		.split(/\r?\n/)
-		.map((line) => {
-			const parts = line.split("\r");
-			return parts[parts.length - 1];
-		})
+		.map((l) => cleanLine(l))
+		.filter((l): l is string => !!l)
 		.join("\n");
-	// Strip leading "[hh:mm:ss.sss --> hh:mm:ss.sss]" timestamp prefixes.
-	out = out.replace(/^\s*\[[^\]]*-->[^\]]*\]\s*/gm, "");
-	// Drop tqdm-style progress bar lines.
-	out = out
-		.split("\n")
-		.filter((l) => !/^\s*\d+%\|/.test(l))
-		.join("\n");
-	// Collapse runs of blank lines.
-	out = out.replace(/\n{3,}/g, "\n\n");
-	return out.trim();
 }
 
 function killChild(child: ChildProcess) {
