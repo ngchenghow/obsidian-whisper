@@ -6,7 +6,7 @@ import {
 	PluginSettingTab,
 	Setting,
 } from "obsidian";
-import { spawn } from "child_process";
+import { spawn, ChildProcess } from "child_process";
 import { promises as fs } from "fs";
 import * as os from "os";
 import * as path from "path";
@@ -27,8 +27,15 @@ const DEFAULT_SETTINGS: WhisperSettings = {
 
 const MEDIA_EXTS = [".mp3", ".mp4", ".m4a", ".wav", ".webm", ".ogg", ".flac"];
 
+interface Transcription {
+	child: ChildProcess;
+	loader: InlineLoader;
+	cancelled: boolean;
+}
+
 export default class WhisperPlugin extends Plugin {
 	settings: WhisperSettings;
+	private active = new Set<Transcription>();
 
 	async onload() {
 		await this.loadSettings();
@@ -50,10 +57,30 @@ export default class WhisperPlugin extends Plugin {
 			},
 		});
 
+		this.addCommand({
+			id: "cancel-transcription",
+			name: "Cancel transcription",
+			callback: () => this.cancelAll(),
+		});
+
 		this.addSettingTab(new WhisperSettingTab(this.app, this));
 	}
 
-	onunload() {}
+	onunload() {
+		this.cancelAll(true);
+	}
+
+	private cancelAll(silent = false) {
+		if (this.active.size === 0) {
+			if (!silent) new Notice("No transcription in progress.");
+			return;
+		}
+		for (const t of Array.from(this.active)) {
+			t.cancelled = true;
+			killChild(t.child);
+		}
+		if (!silent) new Notice("Transcription cancelled.");
+	}
 
 	async loadSettings() {
 		this.settings = Object.assign(
@@ -102,51 +129,75 @@ export default class WhisperPlugin extends Plugin {
 		);
 		loader.start();
 
+		let handle: Transcription | null = null;
 		try {
-			const transcript = await this.runWhisper(resolved);
+			const { child, result } = await this.startWhisper(resolved);
+			handle = { child, loader, cancelled: false };
+			this.active.add(handle);
+			const transcript = await result;
+			if (handle.cancelled) return;
 			loader.finish(transcript);
 			new Notice("Transcription complete.");
 		} catch (err) {
-			console.error("Whisper failed:", err);
-			const msg = err instanceof Error ? err.message : String(err);
-			loader.fail(msg);
-			new Notice(`Whisper failed: ${msg}`);
+			if (handle?.cancelled) {
+				loader.cancel();
+			} else {
+				console.error("Whisper failed:", err);
+				const msg =
+					err instanceof Error ? err.message : String(err);
+				loader.fail(msg);
+				new Notice(`Whisper failed: ${msg}`);
+			}
+		} finally {
+			if (handle) this.active.delete(handle);
 		}
 	}
 
-	private async runWhisper(mediaPath: string): Promise<string> {
+	private async startWhisper(
+		mediaPath: string,
+	): Promise<{ child: ChildProcess; result: Promise<string> }> {
 		const outDir = await fs.mkdtemp(
 			path.join(os.tmpdir(), "obsidian-whisper-"),
 		);
-		try {
-			const args = [
-				mediaPath,
-				"--model",
-				this.settings.model,
-				"--output_format",
-				"txt",
-				"--output_dir",
-				outDir,
-			];
-			if (this.settings.language.trim()) {
-				args.push("--language", this.settings.language.trim());
-			}
-			if (this.settings.extraArgs.trim()) {
-				args.push(...splitArgs(this.settings.extraArgs.trim()));
-			}
-
-			await runProcess(this.settings.whisperPath, args);
-
-			const base = path.basename(
-				mediaPath,
-				path.extname(mediaPath),
-			);
-			const outFile = path.join(outDir, `${base}.txt`);
-			const content = await fs.readFile(outFile, "utf8");
-			return content.trim();
-		} finally {
-			fs.rm(outDir, { recursive: true, force: true }).catch(() => {});
+		const args = [
+			mediaPath,
+			"--model",
+			this.settings.model,
+			"--output_format",
+			"txt",
+			"--output_dir",
+			outDir,
+		];
+		if (this.settings.language.trim()) {
+			args.push("--language", this.settings.language.trim());
 		}
+		if (this.settings.extraArgs.trim()) {
+			args.push(...splitArgs(this.settings.extraArgs.trim()));
+		}
+
+		const { child, done } = runProcess(this.settings.whisperPath, args);
+		const cleanup = () =>
+			fs.rm(outDir, { recursive: true, force: true }).catch(() => {});
+
+		const result = done.then(
+			async () => {
+				try {
+					const base = path.basename(
+						mediaPath,
+						path.extname(mediaPath),
+					);
+					const outFile = path.join(outDir, `${base}.txt`);
+					return (await fs.readFile(outFile, "utf8")).trim();
+				} finally {
+					cleanup();
+				}
+			},
+			(err) => {
+				cleanup();
+				throw err;
+			},
+		);
+		return { child, result };
 	}
 }
 
@@ -183,6 +234,7 @@ class InlineLoader {
 	private editor: Editor;
 	private marker: string;
 	private prefix: string;
+	private suffix: string;
 	private frame = 0;
 	private interval: ReturnType<typeof setInterval> | null = null;
 
@@ -193,6 +245,7 @@ class InlineLoader {
 			Math.random().toString(36).slice(2, 8);
 		this.marker = `<!-- whisper-loader:${id} -->`;
 		this.prefix = `> ⏳ Transcribing \`${filename}\` with \`${model}\` model… `;
+		this.suffix = ` · run **Whisper: Cancel transcription** to stop`;
 	}
 
 	start() {
@@ -211,6 +264,10 @@ class InlineLoader {
 
 	fail(message: string) {
 		this.replaceLoaderWith(`> ❌ Whisper failed: ${message}`);
+	}
+
+	cancel() {
+		this.replaceLoaderWith(`> ⚠️ Transcription cancelled.`);
 	}
 
 	private tick() {
@@ -236,7 +293,7 @@ class InlineLoader {
 	}
 
 	private buildLine(): string {
-		return `${this.prefix}${SPINNER_FRAMES[this.frame]}  ${this.marker}`;
+		return `${this.prefix}${SPINNER_FRAMES[this.frame]}${this.suffix}  ${this.marker}`;
 	}
 
 	private findLoaderLine(): number {
@@ -263,22 +320,37 @@ class InlineLoader {
 	}
 }
 
-function runProcess(cmd: string, args: string[]): Promise<void> {
-	return new Promise((resolve, reject) => {
-		const child = spawn(cmd, args, { shell: false });
-		let stderr = "";
-		child.stderr.on("data", (chunk) => (stderr += chunk.toString()));
+function runProcess(
+	cmd: string,
+	args: string[],
+): { child: ChildProcess; done: Promise<void> } {
+	const child = spawn(cmd, args, { shell: false });
+	let stderr = "";
+	child.stderr?.on("data", (chunk) => (stderr += chunk.toString()));
+	const done = new Promise<void>((resolve, reject) => {
 		child.on("error", reject);
-		child.on("close", (code) => {
+		child.on("close", (code, signal) => {
 			if (code === 0) resolve();
 			else
 				reject(
 					new Error(
-						`exit ${code}${stderr ? `: ${stderr.trim()}` : ""}`,
+						`exit ${code ?? signal}${stderr ? `: ${stderr.trim()}` : ""}`,
 					),
 				);
 		});
 	});
+	return { child, done };
+}
+
+function killChild(child: ChildProcess) {
+	if (child.killed || child.exitCode !== null) return;
+	if (process.platform === "win32" && child.pid) {
+		spawn("taskkill", ["/pid", String(child.pid), "/T", "/F"], {
+			windowsHide: true,
+		});
+	} else {
+		child.kill();
+	}
 }
 
 function splitArgs(s: string): string[] {

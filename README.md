@@ -4,12 +4,13 @@ Transcribe local `mp3` / `mp4` (and other common audio/video) files into your no
 
 ## How it works
 
-Two commands:
+Three commands:
 
 - **Transcribe media (choose file…)** — opens your OS file browser. Pick an mp3/mp4 file and the transcript is inserted at the cursor.
 - **Transcribe media from current line** — reads the absolute path from the line under the cursor. If the line is empty, falls back to the file browser.
+- **Cancel transcription** — kills the running `whisper` process (and any children, via `taskkill /T /F` on Windows). The preloader line is replaced with `⚠️ Transcription cancelled.`
 
-While `whisper` runs, an animated callout is rendered directly below the path showing the current model and a spinner. It is replaced by the transcript when the process completes (or an error line if it fails).
+While `whisper` runs, an animated callout is rendered directly below the path showing the current model and a spinner. It is replaced by the transcript when the process completes (or an error/cancellation line otherwise).
 
 Supported extensions: `.mp3`, `.mp4`, `.m4a`, `.wav`, `.webm`, `.ogg`, `.flac`.
 
