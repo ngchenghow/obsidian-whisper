@@ -97,21 +97,22 @@ export default class WhisperPlugin extends Plugin {
 			return;
 		}
 
-		const notice = new Notice(
-			`Transcribing ${path.basename(resolved)}…`,
-			0,
+		const loader = new InlineLoader(
+			editor,
+			path.basename(resolved),
+			this.settings.model,
 		);
+		loader.start();
+
 		try {
 			const transcript = await this.runWhisper(resolved);
-			insertTranscriptBelowCursor(editor, transcript);
+			loader.finish(transcript);
 			new Notice("Transcription complete.");
 		} catch (err) {
 			console.error("Whisper failed:", err);
-			new Notice(
-				`Whisper failed: ${err instanceof Error ? err.message : String(err)}`,
-			);
-		} finally {
-			notice.hide();
+			const msg = err instanceof Error ? err.message : String(err);
+			loader.fail(msg);
+			new Notice(`Whisper failed: ${msg}`);
 		}
 	}
 
@@ -167,16 +168,101 @@ function extractPath(line: string): string | null {
 	return trimmed;
 }
 
-function insertTranscriptBelowCursor(editor: Editor, transcript: string) {
-	const cursor = editor.getCursor();
-	const lineText = editor.getLine(cursor.line);
-	const endOfLine = { line: cursor.line, ch: lineText.length };
-	const insertion = `\n\n${transcript}\n`;
-	editor.replaceRange(insertion, endOfLine);
-	editor.setCursor({
-		line: cursor.line + insertion.split("\n").length - 1,
-		ch: 0,
-	});
+const SPINNER_FRAMES = [
+	"\u280B",
+	"\u2819",
+	"\u2839",
+	"\u2838",
+	"\u283C",
+	"\u2834",
+	"\u2826",
+	"\u2827",
+	"\u2807",
+	"\u280F",
+];
+
+class InlineLoader {
+	private editor: Editor;
+	private marker: string;
+	private prefix: string;
+	private frame = 0;
+	private interval: ReturnType<typeof setInterval> | null = null;
+
+	constructor(editor: Editor, filename: string, model: string) {
+		this.editor = editor;
+		const id =
+			Date.now().toString(36) +
+			Math.random().toString(36).slice(2, 8);
+		this.marker = `<!-- whisper-loader:${id} -->`;
+		this.prefix = `> ⏳ Transcribing \`${filename}\` with \`${model}\` model… `;
+	}
+
+	start() {
+		const cursor = this.editor.getCursor();
+		const endOfLine = {
+			line: cursor.line,
+			ch: this.editor.getLine(cursor.line).length,
+		};
+		this.editor.replaceRange(`\n\n${this.buildLine()}`, endOfLine);
+		this.interval = setInterval(() => this.tick(), 120);
+	}
+
+	finish(transcript: string) {
+		this.replaceLoaderWith(transcript);
+	}
+
+	fail(message: string) {
+		this.replaceLoaderWith(`> ❌ Whisper failed: ${message}`);
+	}
+
+	private tick() {
+		this.frame = (this.frame + 1) % SPINNER_FRAMES.length;
+		const line = this.findLoaderLine();
+		if (line < 0) {
+			this.stop();
+			return;
+		}
+		this.rewriteLine(line, this.buildLine());
+	}
+
+	private replaceLoaderWith(text: string) {
+		this.stop();
+		const line = this.findLoaderLine();
+		if (line < 0) {
+			const last = this.editor.lineCount() - 1;
+			const endCh = this.editor.getLine(last).length;
+			this.editor.replaceRange(`\n\n${text}\n`, { line: last, ch: endCh });
+			return;
+		}
+		this.rewriteLine(line, text);
+	}
+
+	private buildLine(): string {
+		return `${this.prefix}${SPINNER_FRAMES[this.frame]}  ${this.marker}`;
+	}
+
+	private findLoaderLine(): number {
+		for (let i = 0; i < this.editor.lineCount(); i++) {
+			if (this.editor.getLine(i).includes(this.marker)) return i;
+		}
+		return -1;
+	}
+
+	private rewriteLine(line: number, content: string) {
+		const current = this.editor.getLine(line);
+		this.editor.replaceRange(
+			content,
+			{ line, ch: 0 },
+			{ line, ch: current.length },
+		);
+	}
+
+	private stop() {
+		if (this.interval) {
+			clearInterval(this.interval);
+			this.interval = null;
+		}
+	}
 }
 
 function runProcess(cmd: string, args: string[]): Promise<void> {
