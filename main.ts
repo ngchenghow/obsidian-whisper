@@ -182,12 +182,7 @@ export default class WhisperPlugin extends Plugin {
 		const result = done.then(
 			async () => {
 				try {
-					const base = path.basename(
-						mediaPath,
-						path.extname(mediaPath),
-					);
-					const outFile = path.join(outDir, `${base}.txt`);
-					return (await fs.readFile(outFile, "utf8")).trim();
+					return await readTranscript(outDir, mediaPath);
 				} finally {
 					cleanup();
 				}
@@ -340,6 +335,33 @@ function runProcess(
 		});
 	});
 	return { child, done };
+}
+
+async function readTranscript(
+	outDir: string,
+	mediaPath: string,
+): Promise<string> {
+	const files = await fs.readdir(outDir);
+	const txts = files.filter((f) => f.toLowerCase().endsWith(".txt"));
+	if (txts.length === 0) {
+		throw new Error(
+			`Whisper produced no .txt file. Output dir contents: ${files.join(", ") || "(empty)"}. If your whisper fork doesn't support --output_format, add the right flag via "Extra CLI arguments" in settings.`,
+		);
+	}
+
+	// Prefer a file whose basename matches the media file (any extension stripped).
+	const mediaBase = path
+		.basename(mediaPath, path.extname(mediaPath))
+		.toLowerCase();
+	const exact = txts.find(
+		(f) => path.basename(f, ".txt").toLowerCase() === mediaBase,
+	);
+	const chosen = exact ? [exact] : txts;
+
+	const parts = await Promise.all(
+		chosen.map((f) => fs.readFile(path.join(outDir, f), "utf8")),
+	);
+	return parts.map((p) => p.trim()).filter(Boolean).join("\n\n");
 }
 
 function killChild(child: ChildProcess) {
