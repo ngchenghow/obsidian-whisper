@@ -16,13 +16,24 @@ interface WhisperSettings {
 	model: string;
 	language: string;
 	extraArgs: string;
+	ffmpegPath: string;
+	captureArgs: string;
 }
+
+const DEFAULT_CAPTURE_ARGS =
+	process.platform === "win32"
+		? "-f dshow -i audio=Stereo Mix"
+		: process.platform === "darwin"
+		? "-f avfoundation -i :0"
+		: "-f pulse -i default.monitor";
 
 const DEFAULT_SETTINGS: WhisperSettings = {
 	whisperPath: "whisper",
 	model: "base",
 	language: "",
 	extraArgs: "",
+	ffmpegPath: "ffmpeg",
+	captureArgs: DEFAULT_CAPTURE_ARGS,
 };
 
 const MEDIA_EXTS = [".mp3", ".mp4", ".m4a", ".wav", ".webm", ".ogg", ".flac"];
@@ -33,9 +44,18 @@ interface Transcription {
 	cancelled: boolean;
 }
 
+interface RecordingHandle {
+	child: ChildProcess;
+	filePath: string;
+	editor: Editor;
+	loader: InlineLoader;
+	getStderr: () => string;
+}
+
 export default class WhisperPlugin extends Plugin {
 	settings: WhisperSettings;
 	private active = new Set<Transcription>();
+	private recording: RecordingHandle | null = null;
 
 	async onload() {
 		await this.loadSettings();
@@ -63,11 +83,27 @@ export default class WhisperPlugin extends Plugin {
 			callback: () => this.cancelAll(),
 		});
 
+		this.addCommand({
+			id: "record-system-audio",
+			name: "Start recording system audio",
+			editorCallback: (editor) => this.startRecording(editor),
+		});
+
+		this.addCommand({
+			id: "stop-recording-and-transcribe",
+			name: "Stop recording and transcribe",
+			callback: () => this.stopRecordingAndTranscribe(),
+		});
+
 		this.addSettingTab(new WhisperSettingTab(this.app, this));
 	}
 
 	onunload() {
 		this.cancelAll(true);
+		if (this.recording) {
+			killChild(this.recording.child);
+			this.recording = null;
+		}
 	}
 
 	private cancelAll(silent = false) {
@@ -105,7 +141,11 @@ export default class WhisperPlugin extends Plugin {
 		await this.transcribeAndInsert(filePath, editor);
 	}
 
-	private async transcribeAndInsert(filePath: string, editor: Editor) {
+	private async transcribeAndInsert(
+		filePath: string,
+		editor: Editor,
+		reuseLoader?: InlineLoader,
+	) {
 		const resolved = path.resolve(filePath.trim());
 		try {
 			await fs.access(resolved);
@@ -122,12 +162,21 @@ export default class WhisperPlugin extends Plugin {
 			return;
 		}
 
-		const loader = new InlineLoader(
-			editor,
-			path.basename(resolved),
-			this.settings.model,
-		);
-		loader.start();
+		let loader: InlineLoader;
+		if (reuseLoader) {
+			loader = reuseLoader;
+			loader.switchToTranscribing(
+				path.basename(resolved),
+				this.settings.model,
+			);
+		} else {
+			loader = new InlineLoader(
+				editor,
+				path.basename(resolved),
+				this.settings.model,
+			);
+			loader.start();
+		}
 
 		let handle: Transcription | null = null;
 		const onLine = (line: string) => {
@@ -203,6 +252,134 @@ export default class WhisperPlugin extends Plugin {
 		);
 		return { child, result };
 	}
+
+	private async startRecording(editor: Editor) {
+		if (this.recording) {
+			new Notice(
+				"Already recording. Run 'Whisper: Stop recording and transcribe' first.",
+			);
+			return;
+		}
+
+		const filePath = path.join(
+			os.tmpdir(),
+			`obsidian-whisper-rec-${Date.now()}.wav`,
+		);
+		const captureArgs = this.settings.captureArgs.trim();
+		if (!captureArgs) {
+			new Notice(
+				"System audio capture args are empty. Configure them in plugin settings.",
+			);
+			return;
+		}
+		const args = [
+			...splitArgs(captureArgs),
+			"-ac",
+			"1",
+			"-ar",
+			"16000",
+			"-acodec",
+			"pcm_s16le",
+			"-y",
+			filePath,
+		];
+
+		let child: ChildProcess;
+		try {
+			child = spawn(this.settings.ffmpegPath, args, { shell: false });
+		} catch (err) {
+			new Notice(
+				`Failed to start ffmpeg: ${err instanceof Error ? err.message : String(err)}`,
+			);
+			return;
+		}
+
+		let stderr = "";
+		child.stderr?.on("data", (c) => {
+			stderr += c.toString();
+			if (stderr.length > 4000) stderr = stderr.slice(-4000);
+		});
+
+		const loader = new InlineLoader(editor, "system audio", "recording");
+		loader.startRecording();
+
+		const handle: RecordingHandle = {
+			child,
+			filePath,
+			editor,
+			loader,
+			getStderr: () => stderr,
+		};
+		this.recording = handle;
+
+		child.on("error", (err) => {
+			if (this.recording === handle) {
+				this.recording = null;
+				loader.fail(`ffmpeg error: ${err.message}`);
+			}
+		});
+		child.on("close", (code) => {
+			if (this.recording === handle) {
+				// Unexpected exit (not via stop command).
+				this.recording = null;
+				loader.fail(
+					`ffmpeg exited with code ${code}. ${stderr.slice(-300) || ""}`,
+				);
+			}
+		});
+	}
+
+	private async stopRecordingAndTranscribe() {
+		const rec = this.recording;
+		if (!rec) {
+			new Notice("No recording in progress.");
+			return;
+		}
+		this.recording = null;
+
+		rec.loader.markFinalizing();
+
+		// Ask ffmpeg to finish cleanly.
+		try {
+			rec.child.stdin?.write("q");
+			rec.child.stdin?.end();
+		} catch {
+			/* ignore */
+		}
+
+		const closed = await waitForClose(rec.child, 8000);
+		if (!closed) {
+			killChild(rec.child);
+			await waitForClose(rec.child, 2000);
+		}
+
+		// Verify the recording file exists and is non-empty.
+		let size = 0;
+		try {
+			size = (await fs.stat(rec.filePath)).size;
+		} catch {
+			/* file missing */
+		}
+		if (size < 1024) {
+			rec.loader.fail(
+				`Recording produced no audio (${size} bytes). ffmpeg stderr: ${rec
+					.getStderr()
+					.slice(-400) || "(empty)"}`,
+			);
+			fs.rm(rec.filePath, { force: true }).catch(() => {});
+			return;
+		}
+
+		try {
+			await this.transcribeAndInsert(
+				rec.filePath,
+				rec.editor,
+				rec.loader,
+			);
+		} finally {
+			fs.rm(rec.filePath, { force: true }).catch(() => {});
+		}
+	}
 }
 
 function extractPath(line: string): string | null {
@@ -234,6 +411,8 @@ const SPINNER_FRAMES = [
 	"\u280F",
 ];
 
+type LoaderMode = "transcribing" | "recording" | "finalizing";
+
 class InlineLoader {
 	private editor: Editor;
 	private marker: string;
@@ -242,6 +421,8 @@ class InlineLoader {
 	private frame = 0;
 	private interval: ReturnType<typeof setInterval> | null = null;
 	private streamedAny = false;
+	private mode: LoaderMode = "transcribing";
+	private recordingStartedAt = 0;
 
 	constructor(editor: Editor, filename: string, model: string) {
 		this.editor = editor;
@@ -254,13 +435,43 @@ class InlineLoader {
 	}
 
 	start() {
+		this.mode = "transcribing";
+		this.insertInitial();
+		this.interval = setInterval(() => this.tick(), 120);
+	}
+
+	startRecording() {
+		this.mode = "recording";
+		this.recordingStartedAt = Date.now();
+		this.insertInitial();
+		this.interval = setInterval(() => this.tick(), 500);
+	}
+
+	switchToTranscribing(filename: string, model: string) {
+		this.mode = "transcribing";
+		this.prefix = `> ⏳ Transcribing \`${filename}\` with \`${model}\` model… `;
+		this.suffix = ` · run **Whisper: Cancel transcription** to stop`;
+		this.restartTick(120);
+	}
+
+	markFinalizing() {
+		this.mode = "finalizing";
+		this.restartTick(200);
+	}
+
+	private insertInitial() {
 		const cursor = this.editor.getCursor();
 		const endOfLine = {
 			line: cursor.line,
 			ch: this.editor.getLine(cursor.line).length,
 		};
 		this.editor.replaceRange(`\n\n${this.buildLine()}`, endOfLine);
-		this.interval = setInterval(() => this.tick(), 120);
+	}
+
+	private restartTick(ms: number) {
+		if (this.interval) clearInterval(this.interval);
+		this.interval = setInterval(() => this.tick(), ms);
+		this.tick();
 	}
 
 	appendTranscriptLine(line: string) {
@@ -343,6 +554,18 @@ class InlineLoader {
 	}
 
 	private buildLine(): string {
+		if (this.mode === "recording") {
+			const elapsed = Math.floor(
+				(Date.now() - this.recordingStartedAt) / 1000,
+			);
+			const mm = Math.floor(elapsed / 60);
+			const ss = (elapsed % 60).toString().padStart(2, "0");
+			const dot = this.frame % 2 === 0 ? "🔴" : "⚫";
+			return `> ${dot} Recording system audio… ${mm}:${ss} · run **Whisper: Stop recording and transcribe** to finish  ${this.marker}`;
+		}
+		if (this.mode === "finalizing") {
+			return `> 💾 Finalising recording…  ${this.marker}`;
+		}
 		return `${this.prefix}${SPINNER_FRAMES[this.frame]}${this.suffix}  ${this.marker}`;
 	}
 
@@ -467,6 +690,30 @@ function cleanStdout(s: string): string {
 		.map((l) => cleanLine(l))
 		.filter((l): l is string => !!l)
 		.join("\n");
+}
+
+function waitForClose(
+	child: ChildProcess,
+	timeoutMs: number,
+): Promise<boolean> {
+	return new Promise((resolve) => {
+		if (child.exitCode !== null || child.signalCode) {
+			resolve(true);
+			return;
+		}
+		let done = false;
+		const t = setTimeout(() => {
+			if (done) return;
+			done = true;
+			resolve(false);
+		}, timeoutMs);
+		child.once("close", () => {
+			if (done) return;
+			done = true;
+			clearTimeout(t);
+			resolve(true);
+		});
+	});
 }
 
 function killChild(child: ChildProcess) {
@@ -661,6 +908,39 @@ class WhisperSettingTab extends PluginSettingTab {
 					.setValue(this.plugin.settings.extraArgs)
 					.onChange(async (value) => {
 						this.plugin.settings.extraArgs = value;
+						await this.plugin.saveSettings();
+					}),
+			);
+
+		containerEl.createEl("h3", { text: "System audio recording" });
+
+		new Setting(containerEl)
+			.setName("FFmpeg executable")
+			.setDesc(
+				"Command or absolute path to ffmpeg. Required for 'Start recording system audio'.",
+			)
+			.addText((text) =>
+				text
+					.setPlaceholder("ffmpeg")
+					.setValue(this.plugin.settings.ffmpegPath)
+					.onChange(async (value) => {
+						this.plugin.settings.ffmpegPath =
+							value.trim() || "ffmpeg";
+						await this.plugin.saveSettings();
+					}),
+			);
+
+		new Setting(containerEl)
+			.setName("Capture input arguments")
+			.setDesc(
+				"FFmpeg input args for system audio loopback. Windows: '-f dshow -i audio=Stereo Mix' (enable Stereo Mix in Sound control panel). macOS: '-f avfoundation -i :N' (requires BlackHole / Loopback as device N). Linux: '-f pulse -i default.monitor'. List Windows devices with: ffmpeg -list_devices true -f dshow -i dummy",
+			)
+			.addText((text) =>
+				text
+					.setPlaceholder(DEFAULT_CAPTURE_ARGS)
+					.setValue(this.plugin.settings.captureArgs)
+					.onChange(async (value) => {
+						this.plugin.settings.captureArgs = value;
 						await this.plugin.saveSettings();
 					}),
 			);

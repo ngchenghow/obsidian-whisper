@@ -4,13 +4,23 @@ Transcribe local `mp3` / `mp4` (and other common audio/video) files into your no
 
 ## How it works
 
-Three commands:
+Commands:
 
-- **Transcribe media (choose file…)** — opens your OS file browser. Pick an mp3/mp4 file and the transcript is inserted at the cursor.
-- **Transcribe media from current line** — reads the absolute path from the line under the cursor. If the line is empty, falls back to the file browser.
-- **Cancel transcription** — kills the running `whisper` process (and any children, via `taskkill /T /F` on Windows). The preloader line is replaced with `⚠️ Transcription cancelled.`
+- **Transcribe media (choose file…)** — OS file browser, pick mp3/mp4, transcript inserted at cursor.
+- **Transcribe media from current line** — reads the absolute path from the line under the cursor. Falls back to the file browser if empty.
+- **Cancel transcription** — kills the running `whisper` process.
+- **Start recording system audio** — begins capturing loopback audio via `ffmpeg` into a temp WAV.
+- **Stop recording and transcribe** — stops the recording cleanly and pipes the WAV through whisper, streaming the transcript into the note.
 
-While `whisper` runs, an animated callout is rendered directly below the path showing the current model and a spinner. It is replaced by the transcript when the process completes (or an error/cancellation line otherwise).
+While running, an animated callout is rendered directly below the path. Each line that whisper emits to stdout is appended live, so the transcript streams in as it's produced. On success the spinner line disappears; on cancel/failure it shows a clear message.
+
+## System audio recording
+
+Loopback capture is OS-specific; configure it once in plugin settings:
+
+- **Windows** (default): `-f dshow -i audio=Stereo Mix` — enable "Stereo Mix" in the Sound control panel first. List your devices with `ffmpeg -list_devices true -f dshow -i dummy`.
+- **macOS**: `-f avfoundation -i :N` where N is the index of [BlackHole](https://github.com/ExistentialAudio/BlackHole) or the Loopback app (macOS has no built-in system audio capture).
+- **Linux**: `-f pulse -i default.monitor`.
 
 Supported extensions: `.mp3`, `.mp4`, `.m4a`, `.wav`, `.webm`, `.ogg`, `.flac`.
 
@@ -18,8 +28,9 @@ Markdown links (`[label](path)`), wiki-links (`[[path]]`), and quoted paths are 
 
 ## Requirements
 
-- The [`whisper` CLI](https://github.com/openai/whisper) installed and on your `PATH` (or configure its absolute path in plugin settings).
-- Desktop Obsidian (this plugin shells out to a local process and is not available on mobile).
+- The [`whisper` CLI](https://github.com/openai/whisper) on your `PATH` (or configure its absolute path in plugin settings).
+- [`ffmpeg`](https://ffmpeg.org/) on `PATH` — only needed for the system-audio recording commands.
+- Desktop Obsidian (this plugin shells out to local processes and is not available on mobile).
 
 ## Settings
 
