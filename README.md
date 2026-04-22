@@ -11,6 +11,9 @@ Commands:
 - **Cancel transcription** — kills the running `whisper` process.
 - **Start recording system audio** — begins capturing loopback audio via `ffmpeg` into a temp WAV.
 - **Stop recording and transcribe** — stops the recording cleanly and pipes the WAV through whisper, streaming the transcript into the note.
+- **Start real-time transcription** — captures system audio and transcribes it live. Uses true streaming when a streaming command is configured, otherwise falls back to chunked mode (fixed-length segments transcribed in the background).
+- **Stop real-time transcription** — ends the live session cleanly, flushing the last chunk/buffer.
+- **List system audio devices (for capture args)** — runs `ffmpeg -list_devices` and shows a pick-list that writes the correct capture args into settings.
 
 While running, an animated callout is rendered directly below the path. Each line that whisper emits to stdout is appended live, so the transcript streams in as it's produced. On success the spinner line disappears; on cancel/failure it shows a clear message.
 
@@ -32,6 +35,19 @@ Markdown links (`[label](path)`), wiki-links (`[[path]]`), and quoted paths are 
 - [`ffmpeg`](https://ffmpeg.org/) on `PATH` — only needed for the system-audio recording commands.
 - Desktop Obsidian (this plugin shells out to local processes and is not available on mobile).
 
+## Real-time transcription
+
+Two modes, picked automatically by whether a **Streaming command** is configured:
+
+1. **Chunked (default)** — `ffmpeg` writes fixed-length segments (see *Chunk length*), each segment is transcribed by the regular `whisper` CLI in the background, and lines are appended to the note as each chunk finishes. Simple, works with any stock whisper install, ~chunk-length of latency.
+2. **True streaming** — `ffmpeg` pipes raw PCM (`s16le`, mono, 16 kHz) directly into a user-configured stdin-reading streaming transcriber; every line the tool emits on stdout is appended live. Much lower latency, requires a streaming-capable wrapper.
+
+Example streaming commands:
+
+- [`whisper_streaming`](https://github.com/ufal/whisper_streaming) — `python whisper_online.py --backend faster-whisper --model base --min-chunk-size 1 --vac` (or a small wrapper that reads stdin and feeds the server's `OnlineASRProcessor`).
+- [`whisper.cpp`](https://github.com/ggerganov/whisper.cpp)'s `stream` binary, patched to read stdin instead of the mic.
+- Your own `faster-whisper` / `insanely-fast-whisper` wrapper — just read 16-bit PCM from stdin and `print()` each finalized segment.
+
 ## Settings
 
 | Setting | Default | Description |
@@ -40,6 +56,10 @@ Markdown links (`[label](path)`), wiki-links (`[[path]]`), and quoted paths are 
 | Model | `base` | Whisper model (`tiny`, `base`, `small`, `medium`, `large`, …) |
 | Language | *(auto)* | ISO code — e.g. `en`, `zh`. Blank = auto-detect |
 | Extra CLI arguments | *(empty)* | Free-form flags, e.g. `--task translate --device cuda` |
+| ffmpeg executable | `ffmpeg` | Command name or absolute path to ffmpeg (recording + real-time) |
+| Capture args | OS-specific (see above) | ffmpeg input flags for loopback capture |
+| Chunk length (seconds) | `15` | Segment length for chunked real-time mode |
+| Streaming command | *(empty)* | When set, enables true-streaming real-time mode |
 
 ## Development
 

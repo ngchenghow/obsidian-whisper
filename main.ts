@@ -19,6 +19,8 @@ interface WhisperSettings {
 	extraArgs: string;
 	ffmpegPath: string;
 	captureArgs: string;
+	realtimeChunkSeconds: number;
+	streamingCommand: string;
 }
 
 const DEFAULT_CAPTURE_ARGS =
@@ -35,6 +37,8 @@ const DEFAULT_SETTINGS: WhisperSettings = {
 	extraArgs: "",
 	ffmpegPath: "ffmpeg",
 	captureArgs: DEFAULT_CAPTURE_ARGS,
+	realtimeChunkSeconds: 15,
+	streamingCommand: "",
 };
 
 const MEDIA_EXTS = [".mp3", ".mp4", ".m4a", ".wav", ".webm", ".ogg", ".flac"];
@@ -53,10 +57,38 @@ interface RecordingHandle {
 	getStderr: () => string;
 }
 
+interface RealtimeSession {
+	child: ChildProcess;
+	outDir: string;
+	editor: Editor;
+	loader: InlineLoader;
+	pollHandle: ReturnType<typeof setInterval> | null;
+	queue: string[];
+	seen: Set<string>;
+	transcribing: boolean;
+	stopping: boolean;
+	closed: boolean;
+	closeResolve: (() => void) | null;
+	startedAt: number;
+	getStderr: () => string;
+}
+
+interface StreamingSession {
+	ffmpeg: ChildProcess;
+	streamer: ChildProcess;
+	editor: Editor;
+	loader: InlineLoader;
+	stopping: boolean;
+	getFfmpegStderr: () => string;
+	getStreamerStderr: () => string;
+}
+
 export default class WhisperPlugin extends Plugin {
 	settings: WhisperSettings;
 	private active = new Set<Transcription>();
 	private recording: RecordingHandle | null = null;
+	private realtime: RealtimeSession | null = null;
+	private streaming: StreamingSession | null = null;
 
 	async onload() {
 		await this.loadSettings();
@@ -102,6 +134,18 @@ export default class WhisperPlugin extends Plugin {
 			callback: () => this.listAudioDevices(),
 		});
 
+		this.addCommand({
+			id: "realtime-start",
+			name: "Start real-time transcription",
+			editorCallback: (editor) => this.startRealtime(editor),
+		});
+
+		this.addCommand({
+			id: "realtime-stop",
+			name: "Stop real-time transcription",
+			callback: () => this.stopRealtime(),
+		});
+
 		this.addSettingTab(new WhisperSettingTab(this.app, this));
 	}
 
@@ -110,6 +154,19 @@ export default class WhisperPlugin extends Plugin {
 		if (this.recording) {
 			killChild(this.recording.child);
 			this.recording = null;
+		}
+		if (this.realtime) {
+			if (this.realtime.pollHandle) clearInterval(this.realtime.pollHandle);
+			killChild(this.realtime.child);
+			fs.rm(this.realtime.outDir, { recursive: true, force: true }).catch(
+				() => {},
+			);
+			this.realtime = null;
+		}
+		if (this.streaming) {
+			killChild(this.streaming.ffmpeg);
+			killChild(this.streaming.streamer);
+			this.streaming = null;
 		}
 	}
 
@@ -334,6 +391,408 @@ export default class WhisperPlugin extends Plugin {
 		});
 	}
 
+	private async startRealtime(editor: Editor) {
+		if (this.realtime || this.streaming) {
+			new Notice(
+				"Real-time transcription already running. Stop it first.",
+			);
+			return;
+		}
+		const captureArgs = this.settings.captureArgs.trim();
+		if (!captureArgs) {
+			new Notice(
+				"Configure 'Capture input arguments' in settings first.",
+			);
+			return;
+		}
+		// If a streaming command is configured, use true streaming (pipe).
+		if (this.settings.streamingCommand.trim()) {
+			return this.startStreaming(editor);
+		}
+
+		const outDir = await fs.mkdtemp(
+			path.join(os.tmpdir(), "obsidian-whisper-rt-"),
+		);
+		const pattern = path.join(outDir, "chunk_%05d.wav");
+		const chunkSec = Math.max(
+			5,
+			Math.floor(this.settings.realtimeChunkSeconds || 15),
+		);
+		const args = [
+			...splitArgs(captureArgs),
+			"-ac",
+			"1",
+			"-ar",
+			"16000",
+			"-acodec",
+			"pcm_s16le",
+			"-f",
+			"segment",
+			"-segment_time",
+			String(chunkSec),
+			"-reset_timestamps",
+			"1",
+			"-y",
+			pattern,
+		];
+
+		let child: ChildProcess;
+		try {
+			child = spawn(this.settings.ffmpegPath, args, { shell: false });
+		} catch (err) {
+			fs.rm(outDir, { recursive: true, force: true }).catch(() => {});
+			new Notice(
+				`Failed to start ffmpeg: ${err instanceof Error ? err.message : String(err)}`,
+			);
+			return;
+		}
+
+		let stderr = "";
+		child.stderr?.on("data", (c) => {
+			stderr += c.toString();
+			if (stderr.length > 4000) stderr = stderr.slice(-4000);
+		});
+
+		const loader = new InlineLoader(editor, "system audio", "realtime");
+		loader.startRealtime(chunkSec);
+
+		const session: RealtimeSession = {
+			child,
+			outDir,
+			editor,
+			loader,
+			pollHandle: null,
+			queue: [],
+			seen: new Set(),
+			transcribing: false,
+			stopping: false,
+			closed: false,
+			closeResolve: null,
+			startedAt: Date.now(),
+			getStderr: () => stderr,
+		};
+
+		session.pollHandle = setInterval(
+			() => void this.pollRealtimeChunks(session),
+			1500,
+		);
+
+		child.on("error", (err) =>
+			this.terminateRealtime(session, `ffmpeg error: ${err.message}`),
+		);
+		child.on("close", (code) => {
+			session.closed = true;
+			session.closeResolve?.();
+			if (!session.stopping && this.realtime === session) {
+				this.terminateRealtime(
+					session,
+					diagnoseFfmpegError(code, stderr, captureArgs),
+				);
+			}
+		});
+
+		this.realtime = session;
+	}
+
+	private async pollRealtimeChunks(session: RealtimeSession) {
+		if (this.realtime !== session && !session.stopping) return;
+		let files: string[] = [];
+		try {
+			files = (await fs.readdir(session.outDir))
+				.filter((f) => f.endsWith(".wav"))
+				.sort();
+		} catch {
+			return;
+		}
+		// While ffmpeg is still running, the last file is being written — skip it.
+		// After ffmpeg closes, everything is complete.
+		const completed = session.closed ? files : files.slice(0, -1);
+		for (const f of completed) {
+			if (!session.seen.has(f)) {
+				session.seen.add(f);
+				session.queue.push(path.join(session.outDir, f));
+			}
+		}
+		session.loader.updateRealtime(
+			session.queue.length + (session.transcribing ? 1 : 0),
+		);
+		void this.pumpRealtimeQueue(session);
+	}
+
+	private async pumpRealtimeQueue(session: RealtimeSession) {
+		if (session.transcribing) return;
+		const next = session.queue.shift();
+		if (!next) return;
+		session.transcribing = true;
+		session.loader.updateRealtime(
+			session.queue.length + 1,
+		);
+
+		let streamed = false;
+		try {
+			const { result } = await this.startWhisper(next, (line) => {
+				streamed = true;
+				session.loader.appendTranscriptLine(line);
+			});
+			const transcript = await result;
+			if (!streamed && transcript.trim()) {
+				for (const l of transcript.split(/\r?\n/)) {
+					const trimmed = l.trim();
+					if (trimmed) session.loader.appendTranscriptLine(trimmed);
+				}
+			}
+		} catch (err) {
+			console.error(
+				"whisper: chunk transcription failed:",
+				next,
+				err,
+			);
+			session.loader.appendTranscriptLine(
+				`> [chunk failed: ${err instanceof Error ? err.message : String(err)}]`,
+			);
+		} finally {
+			fs.rm(next, { force: true }).catch(() => {});
+			session.transcribing = false;
+			session.loader.updateRealtime(session.queue.length);
+			// Drain more if available.
+			void this.pumpRealtimeQueue(session);
+		}
+	}
+
+	private async stopRealtime() {
+		if (this.streaming) {
+			return this.stopStreaming();
+		}
+		const session = this.realtime;
+		if (!session) {
+			new Notice("No real-time transcription in progress.");
+			return;
+		}
+		session.stopping = true;
+
+		// Ask ffmpeg to finalise cleanly.
+		try {
+			session.child.stdin?.write("q");
+			session.child.stdin?.end();
+		} catch {
+			/* ignore */
+		}
+
+		// Wait up to 8s for close.
+		if (!session.closed) {
+			await new Promise<void>((resolve) => {
+				session.closeResolve = resolve;
+				setTimeout(resolve, 8000);
+			});
+		}
+		if (!session.closed) {
+			killChild(session.child);
+			await new Promise<void>((resolve) => {
+				session.closeResolve = resolve;
+				setTimeout(resolve, 2000);
+			});
+		}
+
+		session.loader.markFinalizing();
+
+		// Pick up any final chunks.
+		await this.pollRealtimeChunks(session);
+
+		// Drain the queue.
+		while (session.queue.length > 0 || session.transcribing) {
+			await sleep(200);
+		}
+
+		if (session.pollHandle) clearInterval(session.pollHandle);
+		fs.rm(session.outDir, { recursive: true, force: true }).catch(() => {});
+
+		session.loader.finish("");
+		if (this.realtime === session) this.realtime = null;
+		new Notice("Real-time transcription stopped.");
+	}
+
+	private terminateRealtime(session: RealtimeSession, errorMsg: string) {
+		if (this.realtime !== session) return;
+		if (session.pollHandle) clearInterval(session.pollHandle);
+		this.realtime = null;
+		session.loader.fail(errorMsg);
+		fs.rm(session.outDir, { recursive: true, force: true }).catch(() => {});
+	}
+
+	private async startStreaming(editor: Editor) {
+		const captureArgs = this.settings.captureArgs.trim();
+		const streamCmd = this.settings.streamingCommand.trim();
+		if (!streamCmd) {
+			new Notice("Configure 'Streaming command' in settings first.");
+			return;
+		}
+
+		// ffmpeg: capture system audio → raw PCM (s16le mono 16 kHz) on stdout.
+		const ffmpegArgs = [
+			...splitArgs(captureArgs),
+			"-ac",
+			"1",
+			"-ar",
+			"16000",
+			"-acodec",
+			"pcm_s16le",
+			"-f",
+			"s16le",
+			"-",
+		];
+		let ffmpeg: ChildProcess;
+		try {
+			ffmpeg = spawn(this.settings.ffmpegPath, ffmpegArgs, {
+				shell: false,
+			});
+		} catch (err) {
+			new Notice(
+				`Failed to start ffmpeg: ${err instanceof Error ? err.message : String(err)}`,
+			);
+			return;
+		}
+
+		// Streaming command: reads raw PCM on stdin, prints transcript lines on stdout.
+		const streamParts = splitArgs(streamCmd);
+		if (streamParts.length === 0) {
+			killChild(ffmpeg);
+			new Notice("Streaming command is empty.");
+			return;
+		}
+		const [streamBin, ...streamArgs] = streamParts;
+		let streamer: ChildProcess;
+		try {
+			streamer = spawn(streamBin, streamArgs, {
+				shell: false,
+				stdio: ["pipe", "pipe", "pipe"],
+			});
+		} catch (err) {
+			killChild(ffmpeg);
+			new Notice(
+				`Failed to start streaming command: ${err instanceof Error ? err.message : String(err)}`,
+			);
+			return;
+		}
+
+		// Pipe ffmpeg.stdout → streamer.stdin (raw PCM bytes).
+		if (ffmpeg.stdout && streamer.stdin) {
+			ffmpeg.stdout.pipe(streamer.stdin);
+			// Don't let a broken streamer pipe crash the process.
+			ffmpeg.stdout.on("error", () => {});
+			streamer.stdin.on("error", () => {});
+		}
+
+		let ffmpegStderr = "";
+		let streamerStderr = "";
+		ffmpeg.stderr?.on("data", (c) => {
+			ffmpegStderr += c.toString();
+			if (ffmpegStderr.length > 4000)
+				ffmpegStderr = ffmpegStderr.slice(-4000);
+		});
+		streamer.stderr?.on("data", (c) => {
+			streamerStderr += c.toString();
+			if (streamerStderr.length > 4000)
+				streamerStderr = streamerStderr.slice(-4000);
+		});
+
+		const loader = new InlineLoader(editor, "system audio", "streaming");
+		loader.startStreaming();
+
+		const session: StreamingSession = {
+			ffmpeg,
+			streamer,
+			editor,
+			loader,
+			stopping: false,
+			getFfmpegStderr: () => ffmpegStderr,
+			getStreamerStderr: () => streamerStderr,
+		};
+
+		// Line-buffered stdout from the streamer.
+		let pending = "";
+		streamer.stdout?.on("data", (chunk) => {
+			pending += chunk.toString();
+			const parts = pending.split(/\r?\n/);
+			pending = parts.pop() ?? "";
+			for (const raw of parts) {
+				const cleaned = cleanLine(raw);
+				if (cleaned) loader.appendTranscriptLine(cleaned);
+			}
+		});
+
+		// When either side exits unexpectedly, terminate the session.
+		const terminate = (reason: string) => {
+			if (this.streaming !== session) return;
+			if (session.stopping) return;
+			this.streaming = null;
+			try {
+				killChild(ffmpeg);
+			} catch {
+				/* ignore */
+			}
+			try {
+				killChild(streamer);
+			} catch {
+				/* ignore */
+			}
+			loader.fail(reason);
+		};
+
+		ffmpeg.on("error", (err) =>
+			terminate(`ffmpeg error: ${err.message}`),
+		);
+		streamer.on("error", (err) =>
+			terminate(`Streaming command error: ${err.message}`),
+		);
+		ffmpeg.on("close", (code) => {
+			if (session.stopping) return;
+			if (code !== 0 && code !== null) {
+				terminate(
+					diagnoseFfmpegError(code, ffmpegStderr, captureArgs),
+				);
+			}
+		});
+		streamer.on("close", (code) => {
+			if (session.stopping) return;
+			if (code !== 0 && code !== null) {
+				terminate(
+					`Streaming command exited with code ${code}. ${streamerStderr.slice(-400) || "(no stderr)"}`,
+				);
+			}
+		});
+
+		this.streaming = session;
+	}
+
+	private async stopStreaming() {
+		const session = this.streaming;
+		if (!session) {
+			new Notice("No streaming session in progress.");
+			return;
+		}
+		this.streaming = null;
+		session.stopping = true;
+
+		session.loader.markFinalizing();
+
+		// Ask ffmpeg to finish, which will close its stdout and EOF the streamer's stdin.
+		try {
+			session.ffmpeg.stdin?.write("q");
+			session.ffmpeg.stdin?.end();
+		} catch {
+			/* ignore */
+		}
+		const ffmpegClosed = await waitForClose(session.ffmpeg, 5000);
+		if (!ffmpegClosed) killChild(session.ffmpeg);
+
+		// Streamer should flush remaining output and exit once its stdin closes.
+		const streamerClosed = await waitForClose(session.streamer, 15000);
+		if (!streamerClosed) killChild(session.streamer);
+
+		session.loader.finish("");
+		new Notice("Live streaming stopped.");
+	}
+
 	private async listAudioDevices() {
 		const spec = listDevicesCommand(this.settings.ffmpegPath);
 		if (!spec) {
@@ -456,7 +915,7 @@ const SPINNER_FRAMES = [
 	"\u280F",
 ];
 
-type LoaderMode = "transcribing" | "recording" | "finalizing";
+type LoaderMode = "transcribing" | "recording" | "finalizing" | "realtime";
 
 class InlineLoader {
 	private editor: Editor;
@@ -468,6 +927,8 @@ class InlineLoader {
 	private streamedAny = false;
 	private mode: LoaderMode = "transcribing";
 	private recordingStartedAt = 0;
+	private realtimeChunkSec = 15;
+	private realtimeQueue = 0;
 
 	constructor(editor: Editor, filename: string, model: string) {
 		this.editor = editor;
@@ -490,6 +951,28 @@ class InlineLoader {
 		this.recordingStartedAt = Date.now();
 		this.insertInitial();
 		this.interval = setInterval(() => this.tick(), 500);
+	}
+
+	startRealtime(chunkSec: number) {
+		this.mode = "realtime";
+		this.recordingStartedAt = Date.now();
+		this.realtimeChunkSec = chunkSec;
+		this.realtimeQueue = 0;
+		this.insertInitial();
+		this.interval = setInterval(() => this.tick(), 500);
+	}
+
+	startStreaming() {
+		this.mode = "realtime";
+		this.recordingStartedAt = Date.now();
+		this.realtimeChunkSec = 0; // 0 = true streaming, no chunks
+		this.realtimeQueue = 0;
+		this.insertInitial();
+		this.interval = setInterval(() => this.tick(), 500);
+	}
+
+	updateRealtime(queueDepth: number) {
+		this.realtimeQueue = queueDepth;
 	}
 
 	switchToTranscribing(filename: string, model: string) {
@@ -608,8 +1091,25 @@ class InlineLoader {
 			const dot = this.frame % 2 === 0 ? "🔴" : "⚫";
 			return `> ${dot} Recording system audio… ${mm}:${ss} · run **Whisper: Stop recording and transcribe** to finish  ${this.marker}`;
 		}
+		if (this.mode === "realtime") {
+			const elapsed = Math.floor(
+				(Date.now() - this.recordingStartedAt) / 1000,
+			);
+			const mm = Math.floor(elapsed / 60);
+			const ss = (elapsed % 60).toString().padStart(2, "0");
+			const dot = this.frame % 2 === 0 ? "🔴" : "⚫";
+			const label =
+				this.realtimeChunkSec > 0
+					? `chunks ${this.realtimeChunkSec}s`
+					: `streaming`;
+			const queue =
+				this.realtimeQueue > 0
+					? ` · ${this.realtimeQueue} pending`
+					: "";
+			return `> ${dot} Live transcription (${label})… ${mm}:${ss}${queue} · run **Whisper: Stop real-time transcription** to finish  ${this.marker}`;
+		}
 		if (this.mode === "finalizing") {
-			return `> 💾 Finalising recording…  ${this.marker}`;
+			return `> 💾 Finalising…  ${this.marker}`;
 		}
 		return `${this.prefix}${SPINNER_FRAMES[this.frame]}${this.suffix}  ${this.marker}`;
 	}
@@ -759,6 +1259,8 @@ function diagnoseFfmpegError(
 
 	return `ffmpeg exited with code ${code}. ${tail || "(no stderr)"}${hint}`;
 }
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 function waitForClose(
 	child: ChildProcess,
@@ -1180,6 +1682,40 @@ class WhisperSettingTab extends PluginSettingTab {
 					.setValue(this.plugin.settings.captureArgs)
 					.onChange(async (value) => {
 						this.plugin.settings.captureArgs = value;
+						await this.plugin.saveSettings();
+					}),
+			);
+
+		containerEl.createEl("h3", { text: "Real-time transcription" });
+
+		new Setting(containerEl)
+			.setName("Chunk length (seconds)")
+			.setDesc(
+				"For chunked real-time mode (used when no streaming command is set). Smaller = lower latency, worse accuracy. 5–15 is a good range.",
+			)
+			.addText((text) =>
+				text
+					.setPlaceholder("15")
+					.setValue(String(this.plugin.settings.realtimeChunkSeconds))
+					.onChange(async (value) => {
+						const n = parseInt(value, 10);
+						this.plugin.settings.realtimeChunkSeconds =
+							Number.isFinite(n) && n > 0 ? n : 15;
+						await this.plugin.saveSettings();
+					}),
+			);
+
+		new Setting(containerEl)
+			.setName("Streaming command")
+			.setDesc(
+				"Optional. A command that reads raw PCM audio (s16le, mono, 16 kHz) from stdin and prints transcript lines on stdout. When set, the 'Start real-time transcription' command uses true streaming instead of chunked mode. Examples — whisper_streaming (ufal): whisper_online.py --backend faster-whisper --model base --min-chunk-size 1 --vac — or whisper.cpp with a stdin-reading fork — or your own faster-whisper wrapper. Leave empty to use chunked mode.",
+			)
+			.addText((text) =>
+				text
+					.setPlaceholder("(leave empty for chunked mode)")
+					.setValue(this.plugin.settings.streamingCommand)
+					.onChange(async (value) => {
+						this.plugin.settings.streamingCommand = value;
 						await this.plugin.saveSettings();
 					}),
 			);
